@@ -1,82 +1,88 @@
-# --- 1. IMPORTAR LIBRERÍAS ---
+# --- 1. IMPORTACIONES ---
 import os
-import json
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.generativeai as genai
 import psycopg2
+from psycopg2.extras import RealDictCursor # Facilita la obtención de resultados como diccionarios
 
-# --- 2. CARGAR VARIABLES DE ENTORNO Y CONFIGURAR ---
+# --- 2. CONFIGURACIÓN INICIAL ---
+# Carga las variables desde el archivo .env (para desarrollo local)
 load_dotenv()
+
+# Configura la API de Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+# Obtiene la URL de la base de datos
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- 3. INICIAR LA APLICACIÓN FASTAPI ---
+# Define constantes para la estructura de la base de datos para fácil mantenimiento
+NOMBRE_TABLA = '"ARANCELES EC-EEUU"'
+COLUMNAS_DISPONIBLES = '"ReportingCo", "PartnerCountry", "Year", "Revision", "ProductCode", "ProductDescription", "AVE"'
+
+# --- 3. INICIALIZACIÓN DE LA APLICACIÓN FASTAPI ---
 app = FastAPI(
-    title="API de Consulta de Aranceles con IA (usando Gemini)",
-    description="Una API que traduce lenguaje natural a consultas SQL en una base de datos de aranceles."
+    title="API de Consulta de Aranceles con IA",
+    description="Una API que traduce lenguaje natural a consultas SQL seguras y las ejecuta en una base de datos.",
+    version="2.0.0", # Versión robusta y segura
 )
 
-# --- 4. DEFINIR EL FORMATO DE LA PREGUNTA ---
+# --- 4. MODELO DE DATOS DE ENTRADA ---
 class PreguntaUsuario(BaseModel):
     pregunta: str
 
-# --- 5. CREAR EL ENDPOINT PRINCIPAL DE LA API ---
-@app.post("/ask")
-async def procesar_pregunta(datos: PreguntaUsuario):
-    print(f"Pregunta recibida: {datos.pregunta}")
+# --- 5. GESTIÓN DE LA CONEXIÓN A LA BASE DE DATOS (Patrón recomendado en FastAPI) ---
+def get_db_connection():
+    """
+    Crea y gestiona una conexión a la base de datos por cada petición.
+    Se asegura de que la conexión siempre se cierre.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(dsn=DATABASE_URL)
+        yield conn
+    except psycopg2.OperationalError as e:
+        # Error si no se puede conectar a la base de datos (URL incorrecta, etc.)
+        print(f"ERROR DE CONEXIÓN A LA BASE DE DATOS: {e}")
+        raise HTTPException(status_code=503, detail="Servicio de base de datos no disponible.")
+    finally:
+        if conn:
+            conn.close()
 
-    # --- PARTE 1: GENERAR SQL CON GEMINI ---
-    nombre_tabla = '"ARANCELES EC-EEUU"'
-    columnas_disponibles = '"ReportingCo", "PartnerCountry", "Year", "Revision", "ProductCode", "ProductDescription", "AVE"'
-    
-    # CORRECCIÓN: Restauramos el prompt completo que se había perdido.
+# --- 6. ENDPOINTS DE LA API ---
+
+@app.get("/", summary="Endpoint de Bienvenida")
+def bienvenida():
+    """Muestra un mensaje de bienvenida y dirige a la documentación."""
+    return {"mensaje": "API de Aranceles activa. Visita /docs para la documentación interactiva."}
+
+@app.post("/ask", summary="Procesa una pregunta del usuario")
+async def procesar_pregunta(datos: PreguntaUsuario, conn=Depends(get_db_connection)):
+    """
+    Toma una pregunta en lenguaje natural, la convierte en SQL, la valida,
+    la ejecuta de forma segura y devuelve los resultados.
+    """
+    # --- ETAPA 1: GENERAR SQL CON IA ---
     prompt = f"""
-    Tu tarea es convertir la pregunta del usuario en una única consulta SQL para una base de datos PostgreSQL.
-    La tabla se llama {nombre_tabla}.
-    Solo puedes usar las siguientes columnas: {columnas_disponibles}.
-    La consulta debe ser únicamente de tipo SELECT. Nunca uses UPDATE, DELETE o INSERT.
-    La columna "ProductDescription" contiene texto en español, usa el operador ILIKE para búsquedas de texto flexibles.
-    Si no puedes generar una consulta SQL basada en la pregunta, responde únicamente con la palabra 'ERROR'.
+    Tu tarea es convertir la pregunta del usuario en una única consulta SQL SELECT para una base de datos PostgreSQL.
+    La tabla se llama {NOMBRE_TABLA}.
+    Solo puedes usar estas columnas: {COLUMNAS_DISPONIBLES}.
+    La columna "ProductDescription" está en español; usa el operador ILIKE para búsquedas de texto flexibles.
+    Si la pregunta del usuario es ambigua, vaga o no se puede convertir en una consulta SQL, responde ÚNICAMENTE con la palabra 'ERROR'.
+    Nunca uses UPDATE, DELETE, INSERT o cualquier otro comando que no sea SELECT.
     Pregunta del usuario: "{datos.pregunta}"
     Genera únicamente el código SQL.
     """
-
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(prompt)
         sql_query_generada = response.text.replace("```sql", "").replace("```", "").strip()
-        print(f"SQL Generado: {sql_query_generada}")
+        print(f"IA Generó: '{sql_query_generada}'")
     except Exception as e:
-        print(f"Error llamando a la API de Gemini: {e}")
-        return {"error": "No se pudo contactar al servicio de IA."}
+        print(f"ERROR LLAMANDO A LA API DE GEMINI: {e}")
+        raise HTTPException(status_code=502, detail="No se pudo contactar al servicio de IA.")
 
-    # --- PARTE 2: EJECUTAR EL SQL EN SUPABASE ---
-    resultados_db = []
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cursor = conn.cursor()
-        cursor.execute(sql_query_generada)
-        column_names = [desc[0] for desc in cursor.description]
-        resultados = cursor.fetchall()
-        resultados_db = [dict(zip(column_names, row)) for row in resultados]
-        print(f"Resultados de la base de datos: {resultados_db}")
-        cursor.close()
-        conn.close()
-    except Exception as e:
-        print(f"Error conectando o consultando la base de datos: {e}")
-        # Este es el error que estás viendo ahora
-        return {"error": "No se pudo ejecutar la consulta en la base de datos."}
+    # --- ETAPA 2: VALIDACIÓN DEL SQL GENERADO ---
 
-    # --- PARTE 3: DEVOLVER LA RESPUESTA FINAL COMPLETA ---
-    return {
-        "pregunta_original": datos.pregunta,
-        "respuesta_sql_generada": sql_query_generada,
-        "datos_de_la_base_de_datos": resultados_db
-    }
-
-# --- Endpoint de bienvenida ---
-@app.get("/")
-def bienvenida():
-    return {"mensaje": "¡Bienvenido a la API de Aranceles! Visita /docs para probar."}
+    # 2.1: Validar si la IA pudo procesar la pregunta
